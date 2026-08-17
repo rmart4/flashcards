@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tableau de bord — Flashcards Physique-Chimie</title>
+  <link rel="stylesheet" href="style.css" />
+  <style>
+    .dash-login { max-width: 360px; margin: 80px auto; padding: 0 16px; }
+    .dash-login input { width: 100%; padding: 12px 14px; border-radius: 10px; border: 1.5px solid var(--border); font-size: 15px; margin-bottom: 12px; box-sizing: border-box; }
+    .student-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 14px; padding: 16px 18px; margin-bottom: 10px; }
+    .student-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+    .student-name { font-weight: 800; font-size: 16px; color: var(--navy); }
+    .student-last { font-size: 11.5px; color: var(--grey); }
+    .student-row { display: flex; align-items: center; gap: 10px; font-size: 12.5px; margin: 4px 0; }
+    .student-row .label { flex: 0 0 130px; color: var(--txt); font-weight: 600; }
+    .student-row .bar-wrap { flex: 1; height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; }
+    .student-row .bar-wrap > div { height: 100%; border-radius: 3px; }
+    .student-row .pct { width: 34px; text-align: right; font-weight: 700; color: var(--grey); }
+    .sort-bar { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
+    .empty-dash { text-align: center; color: var(--grey); padding: 40px 20px; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+  <script src="firebase-init.js"></script>
+  <script src="data.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>

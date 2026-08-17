@@ -12,8 +12,14 @@ const COLORS = {
 const BOX_WEIGHT = [32, 16, 8, 4, 1]; // box 0 (jamais su / faible) -> box 4 (maîtrisé)
 const MAX_BOX = BOX_WEIGHT.length - 1;
 
-const LS_PROFILES = "pcflash_profiles_v1";
-const statsKey = (profile) => `pcflash_stats_v1::${profile}`;
+const LS_PROFILES = "pcflash_profiles_v2";
+const LS_PROFILES_LEGACY = "pcflash_profiles_v1"; // ancien format (liste de prénoms)
+const statsKey = (profileId) => `pcflash_stats_v2::${profileId}`;
+const statsKeyLegacy = (name) => `pcflash_stats_v1::${name}`;
+
+function genId() {
+  return "p_" + Math.random().toString(36).slice(2, 9) + Date.now().toString(36).slice(-4);
+}
 
 // ---------------------------------------------------------------------------
 // Persistence helpers
@@ -23,22 +29,68 @@ function loadProfiles() {
     const raw = localStorage.getItem(LS_PROFILES);
     if (raw) return JSON.parse(raw);
   } catch (e) {}
-  const initial = { list: ["Élève"], active: "Élève" };
+
+  // Migration depuis l'ancien format (liste de prénoms, sans id) si présent.
+  try {
+    const legacyRaw = localStorage.getItem(LS_PROFILES_LEGACY);
+    if (legacyRaw) {
+      const legacy = JSON.parse(legacyRaw);
+      const list = (legacy.list || []).map((name) => {
+        const id = genId();
+        // Copie les anciennes stats vers la nouvelle clé indexée par id.
+        const oldStats = localStorage.getItem(statsKeyLegacy(name));
+        if (oldStats) localStorage.setItem(statsKey(id), oldStats);
+        return { id, name };
+      });
+      const activeMatch = list.find((p) => p.name === legacy.active);
+      const migrated = { list, activeId: activeMatch ? activeMatch.id : (list[0] ? list[0].id : null) };
+      localStorage.setItem(LS_PROFILES, JSON.stringify(migrated));
+      return migrated;
+    }
+  } catch (e) {}
+
+  const firstId = genId();
+  const initial = { list: [{ id: firstId, name: "Élève" }], activeId: firstId };
   localStorage.setItem(LS_PROFILES, JSON.stringify(initial));
   return initial;
 }
 function saveProfiles(p) {
   localStorage.setItem(LS_PROFILES, JSON.stringify(p));
 }
-function loadStats(profile) {
+function getActiveProfile() {
+  return state.profiles.list.find((p) => p.id === state.profiles.activeId) || state.profiles.list[0];
+}
+function loadStats(profileId) {
   try {
-    const raw = localStorage.getItem(statsKey(profile));
+    const raw = localStorage.getItem(statsKey(profileId));
     if (raw) return JSON.parse(raw);
   } catch (e) {}
   return {};
 }
-function saveStats(profile, stats) {
-  localStorage.setItem(statsKey(profile), JSON.stringify(stats));
+function saveStats(profileId, stats) {
+  localStorage.setItem(statsKey(profileId), JSON.stringify(stats));
+}
+
+// ---------------------------------------------------------------------------
+// Cloud sync (Firebase) — best-effort, l'appli fonctionne même hors ligne
+// grâce au localStorage ; ceci alimente juste le tableau de bord partagé.
+// ---------------------------------------------------------------------------
+let cloudSyncTimer = null;
+function syncToCloud() {
+  if (!window.db) return;
+  clearTimeout(cloudSyncTimer);
+  cloudSyncTimer = setTimeout(() => {
+    const profile = getActiveProfile();
+    if (!profile) return;
+    window.db.collection("students").doc(profile.id).set(
+      {
+        name: profile.name,
+        updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
+        stats: state.stats,
+      },
+      { merge: true }
+    ).catch(() => { /* hors ligne ou erreur réseau : on ignore, tout reste sur l'appareil */ });
+  }, 600);
 }
 
 // ---------------------------------------------------------------------------
@@ -54,12 +106,13 @@ const state = {
   statsMode: "flashcard", // 'flashcard' | 'qcm' — mode shown on the stats screen
   session: null,
   showProfileModal: false,
+  isOnboarding: false, // true = modale forcée au tout premier lancement (demande du prénom)
 };
-state.stats = loadStats(state.profiles.active);
+state.stats = loadStats(state.profiles.activeId);
 
 // Restore last chapter selection (per profile) if present, else select all
 (function initSelection() {
-  const savedRaw = localStorage.getItem(`pcflash_lastsel_v1::${state.profiles.active}`);
+  const savedRaw = localStorage.getItem(`pcflash_lastsel_v2::${state.profiles.activeId}`);
   if (savedRaw) {
     try {
       const saved = JSON.parse(savedRaw);
@@ -70,10 +123,13 @@ state.stats = loadStats(state.profiles.active);
     CHAPTERS.forEach((c) => state.selectedChapters.add(c.id));
   }
 })();
+// Première visite de ce profil sur cet appareil : on l'inscrit tout de suite
+// dans le tableau de bord (même avant la première réponse).
+syncToCloud();
 
 function persistSelection() {
   localStorage.setItem(
-    `pcflash_lastsel_v1::${state.profiles.active}`,
+    `pcflash_lastsel_v2::${state.profiles.activeId}`,
     JSON.stringify([...state.selectedChapters])
   );
 }
@@ -128,7 +184,8 @@ function recordAnswer(id, knew) {
     s.box = 0;
   }
   state.stats[id] = s;
-  saveStats(state.profiles.active, state.stats);
+  saveStats(state.profiles.activeId, state.stats);
+  syncToCloud();
 }
 
 // ---------------------------------------------------------------------------
@@ -241,7 +298,7 @@ function topbar(activeTab) {
           <p>1ère spécialité — Classe de R. Marteletti</p>
         </div>
       </div>
-      <div class="profile-pill" id="profile-pill-btn">👤 ${escapeHtml(state.profiles.active)}</div>
+      <div class="profile-pill" id="profile-pill-btn">👤 ${escapeHtml(getActiveProfile() ? getActiveProfile().name : "")}</div>
     </div>
     <div class="tabs">
       <div class="tab ${activeTab === "home" ? "active" : ""}" data-tab="home">🎯 Réviser</div>
@@ -596,7 +653,7 @@ function renderStats() {
     ${topbar("stats")}
     <div class="panel">
       <h2>Vue d'ensemble</h2>
-      <p class="sub">Profil : ${escapeHtml(state.profiles.active)}</p>
+      <p class="sub">Profil : ${escapeHtml(getActiveProfile() ? getActiveProfile().name : "")}</p>
       <div class="summary-stats" style="margin-top:0;">
         <div class="stat"><div class="n">${g.cardsTouched}</div><div class="l">Cartes travaillées</div></div>
         <div class="stat ok"><div class="n">${g.correct}</div><div class="l">Bonnes réponses</div></div>
@@ -638,9 +695,11 @@ function renderStats() {
     el.onclick = () => { state.statsMode = el.dataset.statsmode; render(); };
   });
   document.getElementById("reset-btn").onclick = () => {
-    if (confirm(`Réinitialiser toutes les statistiques de "${state.profiles.active}" ? Cette action est irréversible.`)) {
+    const profile = getActiveProfile();
+    if (confirm(`Réinitialiser toutes les statistiques de "${profile.name}" ? Cette action est irréversible.`)) {
       state.stats = {};
-      saveStats(state.profiles.active, state.stats);
+      saveStats(profile.id, state.stats);
+      syncToCloud();
       render();
     }
   };
@@ -651,33 +710,37 @@ function renderProfileModal() {
   const wrap = document.createElement("div");
   wrap.className = "modal-backdrop";
   wrap.id = "profile-modal-backdrop";
+  const isFirstLaunch = state.isOnboarding;
   wrap.innerHTML = `
     <div class="modal">
-      <h3>👤 Profils</h3>
-      ${state.profiles.list.map((name) => `
-        <div class="profile-row ${name === state.profiles.active ? "active" : ""}" data-name="${escapeHtml(name)}">
-          <span class="name">${escapeHtml(name)}</span>
-          ${state.profiles.list.length > 1 ? `<span class="del" data-del="${escapeHtml(name)}">Supprimer</span>` : ""}
+      <h3>👤 ${isFirstLaunch ? "Bienvenue ! Comment tu t'appelles ?" : "Profils"}</h3>
+      ${isFirstLaunch ? `<p class="sub" style="margin-top:-8px;">Ton prénom permet à ton professeur de suivre ta progression. Tu peux changer de profil à tout moment si vous partagez cet appareil.</p>` : ""}
+      ${state.profiles.list.map((p) => `
+        <div class="profile-row ${p.id === state.profiles.activeId ? "active" : ""}" data-id="${escapeHtml(p.id)}">
+          <span class="name">${escapeHtml(p.name)}</span>
+          ${state.profiles.list.length > 1 ? `<span class="del" data-del="${escapeHtml(p.id)}">Supprimer</span>` : ""}
         </div>
       `).join("")}
       <div class="new-profile-row">
-        <input type="text" id="new-profile-input" placeholder="Nouveau prénom…" maxlength="24" />
-        <button class="btn btn-secondary" id="add-profile-btn">Ajouter</button>
+        <input type="text" id="new-profile-input" placeholder="${isFirstLaunch ? "Ton prénom…" : "Nouveau prénom…"}" maxlength="24" />
+        <button class="btn btn-secondary" id="add-profile-btn">${isFirstLaunch ? "C'est parti" : "Ajouter"}</button>
       </div>
-      <button class="btn btn-ghost" id="close-modal-btn" style="width:100%;margin-top:14px;">Fermer</button>
+      ${!isFirstLaunch ? `<button class="btn btn-ghost" id="close-modal-btn" style="width:100%;margin-top:14px;">Fermer</button>` : ""}
     </div>
   `;
   document.body.appendChild(wrap);
 
-  wrap.addEventListener("click", (e) => {
-    if (e.target === wrap) closeModal();
-  });
-  document.getElementById("close-modal-btn").onclick = closeModal;
+  if (!isFirstLaunch) {
+    wrap.addEventListener("click", (e) => {
+      if (e.target === wrap) closeModal();
+    });
+    document.getElementById("close-modal-btn").onclick = closeModal;
+  }
 
   wrap.querySelectorAll(".profile-row").forEach((row) => {
     row.addEventListener("click", (e) => {
       if (e.target.dataset.del) return;
-      switchProfile(row.dataset.name);
+      switchProfile(row.dataset.id);
     });
   });
   wrap.querySelectorAll(".del").forEach((el) => {
@@ -699,35 +762,55 @@ function renderProfileModal() {
     const input = document.getElementById("new-profile-input");
     const name = input.value.trim();
     if (!name) return;
-    if (!state.profiles.list.includes(name)) {
-      state.profiles.list.push(name);
+
+    if (isFirstLaunch) {
+      // Premier lancement : on renomme le profil "Élève" créé par défaut
+      // au lieu d'en ajouter un nouveau.
+      const profile = getActiveProfile();
+      profile.name = name;
+      saveProfiles(state.profiles);
+      localStorage.setItem("pcflash_onboarded_v1", "1");
+      state.isOnboarding = false;
+      syncToCloud();
+      closeModal();
+      state.screen = "home";
+      render();
+      return;
     }
+
+    // Chaque profil a un identifiant unique, même si deux élèves ont le même
+    // prénom — évite que leurs statistiques ne se mélangent.
+    const id = genId();
+    state.profiles.list.push({ id, name });
     saveProfiles(state.profiles);
-    switchProfile(name);
+    switchProfile(id);
   }
-  function switchProfile(name) {
-    state.profiles.active = name;
+  function switchProfile(id) {
+    state.profiles.activeId = id;
     saveProfiles(state.profiles);
-    state.stats = loadStats(name);
+    state.stats = loadStats(id);
     state.selectedChapters.clear();
-    const savedRaw = localStorage.getItem(`pcflash_lastsel_v1::${name}`);
+    const savedRaw = localStorage.getItem(`pcflash_lastsel_v2::${id}`);
     if (savedRaw) {
-      try { JSON.parse(savedRaw).forEach((id) => state.selectedChapters.add(id)); } catch (e) {}
+      try { JSON.parse(savedRaw).forEach((cid) => state.selectedChapters.add(cid)); } catch (e) {}
     }
     if (state.selectedChapters.size === 0) CHAPTERS.forEach((c) => state.selectedChapters.add(c.id));
+    syncToCloud();
     closeModal();
     state.screen = "home";
     render();
   }
-  function deleteProfile(name) {
+  function deleteProfile(id) {
     if (state.profiles.list.length <= 1) return;
-    if (!confirm(`Supprimer le profil "${name}" et toutes ses statistiques ?`)) return;
-    state.profiles.list = state.profiles.list.filter((n) => n !== name);
-    localStorage.removeItem(statsKey(name));
-    localStorage.removeItem(`pcflash_lastsel_v1::${name}`);
-    if (state.profiles.active === name) {
-      state.profiles.active = state.profiles.list[0];
-      state.stats = loadStats(state.profiles.active);
+    const target = state.profiles.list.find((p) => p.id === id);
+    if (!target) return;
+    if (!confirm(`Supprimer le profil "${target.name}" et toutes ses statistiques ?`)) return;
+    state.profiles.list = state.profiles.list.filter((p) => p.id !== id);
+    localStorage.removeItem(statsKey(id));
+    localStorage.removeItem(`pcflash_lastsel_v2::${id}`);
+    if (state.profiles.activeId === id) {
+      state.profiles.activeId = state.profiles.list[0].id;
+      state.stats = loadStats(state.profiles.activeId);
     }
     saveProfiles(state.profiles);
     closeModal();
@@ -736,4 +819,11 @@ function renderProfileModal() {
 }
 
 // ---------------------------------------------------------------------------
+// Au tout premier lancement sur cet appareil (jamais de prénom personnalisé
+// enregistré), on force la demande de prénom avant de laisser réviser.
+if (!localStorage.getItem("pcflash_onboarded_v1")) {
+  state.isOnboarding = true;
+  state.showProfileModal = true;
+}
+
 render();
