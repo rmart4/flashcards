@@ -6,7 +6,7 @@
 // visible dans ce fichier), suffisante pour éviter qu'un élève curieux tombe
 // dessus par hasard — pas une vraie sécurité. Change-le avant de partager le
 // lien du tableau de bord à qui que ce soit.
-const DASH_PASSWORD = "PhysChim2026";
+const DASH_PASSWORD = "PCRM";
 
 const BOX_WEIGHT = [32, 16, 8, 4, 1];
 const MAX_BOX = BOX_WEIGHT.length - 1;
