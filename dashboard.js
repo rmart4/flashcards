@@ -6,10 +6,24 @@
 // visible dans ce fichier), suffisante pour éviter qu'un élève curieux tombe
 // dessus par hasard — pas une vraie sécurité. Change-le avant de partager le
 // lien du tableau de bord à qui que ce soit.
-const DASH_PASSWORD = "PCRM";
+const DASH_PASSWORD = "PhysChim2026";
 
 const BOX_WEIGHT = [32, 16, 8, 4, 1];
 const MAX_BOX = BOX_WEIGHT.length - 1;
+
+const LEVELS = {
+  seconde: { label: "Seconde", chapters: () => CHAPTERS_SECONDE },
+  premiere: { label: "1ère spécialité", chapters: () => CHAPTERS },
+};
+function chaptersForLevel(level) {
+  // Les enregistrements créés avant l'ajout du niveau Seconde n'ont pas de
+  // champ "level" : on suppose alors Première (seul niveau qui existait).
+  const lvl = LEVELS[level] || LEVELS.premiere;
+  return lvl.chapters();
+}
+function levelLabel(level) {
+  return (LEVELS[level] || LEVELS.premiere).label;
+}
 
 function cardId(chapterId, mode, idx) {
   return `${chapterId}::${mode}::${idx}`;
@@ -27,10 +41,12 @@ function chapterMasteryFrom(stats, chapter, mode) {
   items.forEach((_, i) => { total += getBoxFrom(stats, cardId(chapter.id, mode, i)); });
   return items.length ? Math.round((total / (items.length * MAX_BOX)) * 100) : 0;
 }
-function overallMasteryFrom(stats, mode) {
+function overallMasteryFrom(stats, mode, level) {
+  const chapters = chaptersForLevel(level);
+  if (chapters.length === 0) return 0;
   let sumPct = 0;
-  CHAPTERS.forEach((c) => { sumPct += chapterMasteryFrom(stats, c, mode); });
-  return Math.round(sumPct / CHAPTERS.length);
+  chapters.forEach((c) => { sumPct += chapterMasteryFrom(stats, c, mode); });
+  return Math.round(sumPct / chapters.length);
 }
 function globalCountsFrom(stats) {
   let seen = 0, correct = 0, wrong = 0;
@@ -58,6 +74,7 @@ function escapeHtml(str) {
 const app = document.getElementById("app");
 let students = [];
 let sortBy = "recent";
+let levelFilter = "all"; // 'all' | 'seconde' | 'premiere'
 
 function renderLogin() {
   app.innerHTML = `
@@ -93,7 +110,8 @@ function renderLoading() {
 }
 
 function renderDashboard() {
-  const sorted = [...students];
+  const filtered = levelFilter === "all" ? students : students.filter((s) => (s.level || "premiere") === levelFilter);
+  const sorted = [...filtered];
   if (sortBy === "name") sorted.sort((a, b) => a.name.localeCompare(b.name, "fr"));
   else if (sortBy === "mastery") sorted.sort((a, b) => (b.fcMastery + b.qcmMastery) - (a.fcMastery + a.qcmMastery));
   else sorted.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
@@ -104,7 +122,7 @@ function renderDashboard() {
         <div class="logo">📊</div>
         <div>
           <h1>Tableau de bord</h1>
-          <p>${students.length} élève${students.length > 1 ? "s" : ""} enregistré${students.length > 1 ? "s" : ""} — Physique-Chimie 1ère spé</p>
+          <p>${students.length} élève${students.length > 1 ? "s" : ""} enregistré${students.length > 1 ? "s" : ""} — Physique-Chimie</p>
         </div>
       </div>
       ${students.length === 0 ? `
@@ -113,18 +131,26 @@ function renderDashboard() {
         </div>
       ` : `
         <div class="sort-bar">
+          <div class="count-opt ${levelFilter === "all" ? "active" : ""}" data-level="all">Tous niveaux</div>
+          <div class="count-opt ${levelFilter === "seconde" ? "active" : ""}" data-level="seconde">Seconde</div>
+          <div class="count-opt ${levelFilter === "premiere" ? "active" : ""}" data-level="premiere">1ère spé</div>
+        </div>
+        <div class="sort-bar">
           <div class="count-opt ${sortBy === "recent" ? "active" : ""}" data-sort="recent">Plus récents</div>
           <div class="count-opt ${sortBy === "name" ? "active" : ""}" data-sort="name">Nom (A-Z)</div>
           <div class="count-opt ${sortBy === "mastery" ? "active" : ""}" data-sort="mastery">Progression</div>
           <div class="count-opt" id="refresh-btn">🔄 Actualiser</div>
         </div>
-        ${sorted.map(studentCardHtml).join("")}
+        ${sorted.length === 0 ? `<div class="panel empty-dash"><p>Aucun élève dans ce niveau pour l'instant.</p></div>` : sorted.map(studentCardHtml).join("")}
       `}
     </div>
   `;
 
   document.querySelectorAll("[data-sort]").forEach((el) => {
     el.onclick = () => { sortBy = el.dataset.sort; renderDashboard(); };
+  });
+  document.querySelectorAll("[data-level]").forEach((el) => {
+    el.onclick = () => { levelFilter = el.dataset.level; renderDashboard(); };
   });
   const refreshBtn = document.getElementById("refresh-btn");
   if (refreshBtn) refreshBtn.onclick = () => { renderLoading(); loadAndRender(); };
@@ -134,7 +160,7 @@ function studentCardHtml(st) {
   return `
     <div class="student-card">
       <div class="student-head">
-        <div class="student-name">${escapeHtml(st.name)}</div>
+        <div class="student-name">${escapeHtml(st.name)} <span style="font-weight:600;font-size:11px;color:var(--grey);border:1px solid var(--border);border-radius:999px;padding:2px 8px;margin-left:4px;">${escapeHtml(levelLabel(st.level))}</span></div>
         <div class="student-last">${timeAgo(st.updatedAt)}</div>
       </div>
       <div class="student-row">
@@ -165,12 +191,14 @@ function loadAndRender() {
     snapshot.forEach((doc) => {
       const data = doc.data();
       const stats = data.stats || {};
+      const level = data.level || "premiere";
       students.push({
         id: doc.id,
         name: data.name || "(sans nom)",
+        level,
         updatedAt: data.updatedAt && data.updatedAt.toMillis ? data.updatedAt.toMillis() : null,
-        fcMastery: overallMasteryFrom(stats, "flashcard"),
-        qcmMastery: overallMasteryFrom(stats, "qcm"),
+        fcMastery: overallMasteryFrom(stats, "flashcard", level),
+        qcmMastery: overallMasteryFrom(stats, "qcm", level),
         counts: globalCountsFrom(stats),
       });
     });

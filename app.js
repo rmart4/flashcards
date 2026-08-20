@@ -9,6 +9,17 @@ const COLORS = {
   violet: { c1: "#8e24aa", c2: "#6a1b9a" },
 };
 
+// Niveaux disponibles. CHAPTERS (Première) vient de data.js, CHAPTERS_SECONDE
+// de data-seconde.js — les deux scripts doivent être chargés avant app.js.
+const LEVELS = {
+  seconde: { label: "Seconde", chapters: () => CHAPTERS_SECONDE },
+  premiere: { label: "1ère spécialité", chapters: () => CHAPTERS },
+};
+function getChapters() {
+  const lvl = LEVELS[state.level];
+  return lvl ? lvl.chapters() : [];
+}
+
 const BOX_WEIGHT = [32, 16, 8, 4, 1]; // box 0 (jamais su / faible) -> box 4 (maîtrisé)
 const MAX_BOX = BOX_WEIGHT.length - 1;
 
@@ -85,6 +96,7 @@ function syncToCloud() {
     window.db.collection("students").doc(profile.id).set(
       {
         name: profile.name,
+        level: state.level,
         updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
         stats: state.stats,
       },
@@ -107,20 +119,24 @@ const state = {
   session: null,
   showProfileModal: false,
   isOnboarding: false, // true = modale forcée au tout premier lancement (demande du prénom)
+  onboardingChecking: false, // true = vérification de disponibilité du prénom en cours
+  onboardingSuggestion: null, // {typed, suggested} si le prénom tapé est déjà pris
+  level: null, // 'seconde' | 'premiere' | null (aucun niveau choisi = écran de choix forcé)
 };
 state.stats = loadStats(state.profiles.activeId);
+state.level = localStorage.getItem(`pcflash_level_v1::${state.profiles.activeId}`) || null;
+state.screen = state.level ? "home" : "level";
 
-// Restore last chapter selection (per profile) if present, else select all
+// Restore last chapter selection (per profile + niveau) si présente. Aucun
+// chapitre n'est présélectionné par défaut : l'élève doit choisir lui-même.
 (function initSelection() {
-  const savedRaw = localStorage.getItem(`pcflash_lastsel_v2::${state.profiles.activeId}`);
+  if (!state.level) return;
+  const savedRaw = localStorage.getItem(`pcflash_lastsel_v2::${state.profiles.activeId}::${state.level}`);
   if (savedRaw) {
     try {
       const saved = JSON.parse(savedRaw);
       saved.forEach((id) => state.selectedChapters.add(id));
     } catch (e) {}
-  }
-  if (state.selectedChapters.size === 0) {
-    CHAPTERS.forEach((c) => state.selectedChapters.add(c.id));
   }
 })();
 // Première visite de ce profil sur cet appareil : on l'inscrit tout de suite
@@ -129,7 +145,7 @@ syncToCloud();
 
 function persistSelection() {
   localStorage.setItem(
-    `pcflash_lastsel_v2::${state.profiles.activeId}`,
+    `pcflash_lastsel_v2::${state.profiles.activeId}::${state.level}`,
     JSON.stringify([...state.selectedChapters])
   );
 }
@@ -193,7 +209,7 @@ function recordAnswer(id, knew) {
 // ---------------------------------------------------------------------------
 function buildPool(chapterIds, mode) {
   const pool = [];
-  CHAPTERS.forEach((c) => {
+  getChapters().forEach((c) => {
     if (!chapterIds.has(c.id)) return;
     const items = chapterItems(c, mode);
     items.forEach((item, i) => {
@@ -259,17 +275,74 @@ function prepareQueueItem(pick, mode) {
   };
 }
 
+// Groups a flat pool by chapter — used to guarantee balanced representation
+// across chapters when several are selected for a session.
+function groupByChapter(pool) {
+  const groups = {};
+  const order = [];
+  pool.forEach((item) => {
+    if (!groups[item.chapterId]) {
+      groups[item.chapterId] = [];
+      order.push(item.chapterId);
+    }
+    groups[item.chapterId].push(item);
+  });
+  return { groups, order };
+}
+
 function buildSessionQueue(pool, count, mode) {
+  const { groups, order } = groupByChapter(pool);
+  const numChapters = order.length;
+  if (numChapters === 0) return [];
+
   if (count === "all") {
-    return shuffleArray(pool).map((p) => prepareQueueItem(p, mode));
+    // Toutes les cartes, mais entrelacées chapitre par chapitre plutôt que
+    // regroupées en blocs, pour varier les sujets d'une carte à l'autre.
+    const shuffled = {};
+    order.forEach((k) => { shuffled[k] = shuffleArray(groups[k]); });
+    const queue = [];
+    let i = 0;
+    let more = true;
+    while (more) {
+      more = false;
+      for (const k of order) {
+        if (i < shuffled[k].length) {
+          queue.push(prepareQueueItem(shuffled[k][i], mode));
+          more = true;
+        }
+      }
+      i++;
+    }
+    return queue;
   }
-  const n = Math.min(count, pool.length > 0 ? count : 0);
+
+  // Nombre de cartes fixé : on répartit équitablement entre les chapitres
+  // sélectionnés (le reste de la division va aux premiers chapitres), puis
+  // on tire, à l'intérieur de chaque chapitre, selon la répétition espacée.
+  const base = Math.floor(count / numChapters);
+  const remainder = count - base * numChapters;
+  const perChapterQueue = {};
+  order.forEach((k, idx) => {
+    const n = base + (idx < remainder ? 1 : 0);
+    const chapterPool = groups[k];
+    const qArr = [];
+    let lastId = null;
+    for (let i = 0; i < n; i++) {
+      const pick = weightedPick(chapterPool, lastId);
+      qArr.push(prepareQueueItem(pick, mode));
+      lastId = pick.id;
+    }
+    perChapterQueue[k] = qArr;
+  });
+
+  // Entrelace les chapitres (round-robin) plutôt que de les mettre bout à
+  // bout, pour éviter une série de questions du même chapitre d'affilée.
   const queue = [];
-  let lastId = null;
-  for (let i = 0; i < n; i++) {
-    const pick = weightedPick(pool, lastId);
-    queue.push(prepareQueueItem(pick, mode));
-    lastId = pick.id;
+  const maxLen = Math.max(...order.map((k) => perChapterQueue[k].length));
+  for (let i = 0; i < maxLen; i++) {
+    for (const k of order) {
+      if (perChapterQueue[k][i]) queue.push(perChapterQueue[k][i]);
+    }
   }
   return queue;
 }
@@ -280,7 +353,8 @@ function buildSessionQueue(pool, count, mode) {
 const app = document.getElementById("app");
 
 function render() {
-  if (state.screen === "home") renderHome();
+  if (state.screen === "level") renderLevelPicker();
+  else if (state.screen === "home") renderHome();
   else if (state.screen === "practice") renderPractice();
   else if (state.screen === "summary") renderSummary();
   else if (state.screen === "stats") renderStats();
@@ -289,13 +363,14 @@ function render() {
 }
 
 function topbar(activeTab) {
+  const levelLabel = LEVELS[state.level] ? LEVELS[state.level].label : "";
   return `
     <div class="topbar">
       <div class="brand">
         <div class="logo">🧪</div>
         <div>
           <h1>Flashcards Physique-Chimie</h1>
-          <p>1ère spécialité — Classe de R. Marteletti</p>
+          <p>${escapeHtml(levelLabel)} — Classe de R. Marteletti</p>
         </div>
       </div>
       <div class="profile-pill" id="profile-pill-btn">👤 ${escapeHtml(getActiveProfile() ? getActiveProfile().name : "")}</div>
@@ -303,8 +378,21 @@ function topbar(activeTab) {
     <div class="tabs">
       <div class="tab ${activeTab === "home" ? "active" : ""}" data-tab="home">🎯 Réviser</div>
       <div class="tab ${activeTab === "stats" ? "active" : ""}" data-tab="stats">📊 Statistiques</div>
+      <div class="tab" id="change-level-btn">🔀 ${escapeHtml(levelLabel)}</div>
     </div>
   `;
+}
+
+function bindChangeLevelButton() {
+  const btn = document.getElementById("change-level-btn");
+  if (btn) {
+    btn.onclick = () => {
+      state.level = null;
+      state.selectedChapters.clear();
+      state.screen = "level";
+      render();
+    };
+  }
 }
 
 function escapeHtml(str) {
@@ -313,9 +401,65 @@ function escapeHtml(str) {
   return d.innerHTML;
 }
 
+// ---------- LEVEL PICKER ----------
+function renderLevelPicker() {
+  app.innerHTML = `
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo">🧪</div>
+        <div>
+          <h1>Flashcards Physique-Chimie</h1>
+          <p>Classe de R. Marteletti</p>
+        </div>
+      </div>
+      <div class="profile-pill" id="profile-pill-btn">👤 ${escapeHtml(getActiveProfile() ? getActiveProfile().name : "")}</div>
+    </div>
+    <div class="panel">
+      <h2>Choisis ton niveau</h2>
+      <p class="sub">Tu pourras en changer à tout moment depuis l'écran d'accueil.</p>
+      <div class="mode-select">
+        <div class="mode-opt" data-level="seconde">
+          <div class="mode-icon">🧭</div>
+          <div class="mode-name">Seconde</div>
+          <div class="mode-desc">${CHAPTERS_SECONDE.length} chapitres</div>
+        </div>
+        <div class="mode-opt" data-level="premiere">
+          <div class="mode-icon">⚗️</div>
+          <div class="mode-name">1ère spécialité</div>
+          <div class="mode-desc">${CHAPTERS.length} chapitres</div>
+        </div>
+        <div class="mode-opt" style="opacity:0.5;cursor:default;position:relative;">
+          <div class="mode-icon">🚧</div>
+          <div class="mode-name">Terminale</div>
+          <div class="mode-desc">En construction</div>
+        </div>
+      </div>
+    </div>
+    <p class="footer-note">Fait avec ❤️ pour réviser la physique-chimie — données stockées uniquement sur cet appareil.</p>
+  `;
+
+  document.getElementById("profile-pill-btn").onclick = () => {
+    state.showProfileModal = true;
+    render();
+  };
+  document.querySelectorAll("[data-level]").forEach((el) => {
+    el.onclick = () => {
+      state.level = el.dataset.level;
+      localStorage.setItem(`pcflash_level_v1::${state.profiles.activeId}`, state.level);
+      state.selectedChapters.clear();
+      const savedRaw = localStorage.getItem(`pcflash_lastsel_v2::${state.profiles.activeId}::${state.level}`);
+      if (savedRaw) {
+        try { JSON.parse(savedRaw).forEach((id) => state.selectedChapters.add(id)); } catch (e) {}
+      }
+      state.screen = "home";
+      render();
+    };
+  });
+}
+
 // ---------- HOME ----------
 function renderHome() {
-  const allSelected = state.selectedChapters.size === CHAPTERS.length;
+  const allSelected = state.selectedChapters.size === getChapters().length;
   const pool = buildPool(state.selectedChapters, state.mode);
 
   app.innerHTML = `
@@ -327,7 +471,7 @@ function renderHome() {
       </div>
       <p class="sub">Un chapitre, plusieurs, ou tous — comme tu veux. Les questions les moins bien sues reviendront plus souvent.</p>
       <div class="chapter-list">
-        ${CHAPTERS.map((c) => chapterItemHtml(c)).join("")}
+        ${getChapters().map((c) => chapterItemHtml(c)).join("")}
       </div>
     </div>
 
@@ -367,12 +511,13 @@ function renderHome() {
     state.showProfileModal = true;
     render();
   };
-  document.querySelectorAll(".tab").forEach((el) => {
+  bindChangeLevelButton();
+  document.querySelectorAll(".tab[data-tab]").forEach((el) => {
     el.onclick = () => { state.screen = el.dataset.tab; render(); };
   });
   document.getElementById("toggle-all-btn").onclick = () => {
     if (allSelected) state.selectedChapters.clear();
-    else CHAPTERS.forEach((c) => state.selectedChapters.add(c.id));
+    else getChapters().forEach((c) => state.selectedChapters.add(c.id));
     persistSelection();
     render();
   };
@@ -669,7 +814,7 @@ function renderStats() {
         <div class="tab ${state.statsMode === "qcm" ? "active" : ""}" data-statsmode="qcm">✅ QCM</div>
       </div>
       <p class="sub">Le pourcentage reflète le niveau de maîtrise (0% = jamais su, 100% = totalement maîtrisé).</p>
-      ${CHAPTERS.map((c) => {
+      ${getChapters().map((c) => {
         const m = chapterMastery(c, state.statsMode);
         const colors = COLORS[c.color];
         return `
@@ -688,6 +833,7 @@ function renderStats() {
     state.showProfileModal = true;
     render();
   };
+  bindChangeLevelButton();
   document.querySelectorAll(".tab[data-tab]").forEach((el) => {
     el.onclick = () => { state.screen = el.dataset.tab; render(); };
   });
@@ -706,15 +852,44 @@ function renderStats() {
 }
 
 // ---------- PROFILE MODAL ----------
+function removeModalBackdrop() {
+  const el = document.getElementById("profile-modal-backdrop");
+  if (el) el.remove();
+}
 function renderProfileModal() {
+  const existing = document.getElementById("profile-modal-backdrop");
+  if (existing) existing.remove();
   const wrap = document.createElement("div");
   wrap.className = "modal-backdrop";
   wrap.id = "profile-modal-backdrop";
   const isFirstLaunch = state.isOnboarding;
-  wrap.innerHTML = `
-    <div class="modal">
-      <h3>👤 ${isFirstLaunch ? "Bienvenue ! Comment tu t'appelles ?" : "Profils"}</h3>
-      ${isFirstLaunch ? `<p class="sub" style="margin-top:-8px;">Ton prénom permet à ton professeur de suivre ta progression. Tu peux changer de profil à tout moment si vous partagez cet appareil.</p>` : ""}
+  const suggestion = state.onboardingSuggestion;
+
+  let bodyHtml;
+  if (isFirstLaunch && suggestion) {
+    bodyHtml = `
+      <h3>👤 Ce prénom est déjà pris</h3>
+      <p class="sub" style="margin-top:-8px;">Quelqu'un d'autre utilise déjà « ${escapeHtml(suggestion.typed)} ». On te propose plutôt :</p>
+      <div class="profile-row active" style="justify-content:center;">
+        <span class="name" style="font-size:17px;">${escapeHtml(suggestion.suggested)}</span>
+      </div>
+      <div class="btn-row" style="margin-top:14px;">
+        <button class="btn btn-secondary" id="suggestion-retry-btn">Choisir un autre prénom</button>
+        <button class="btn btn-primary" id="suggestion-accept-btn">Utiliser ce nom</button>
+      </div>
+    `;
+  } else if (isFirstLaunch) {
+    bodyHtml = `
+      <h3>👤 Bienvenue ! Comment tu t'appelles ?</h3>
+      <p class="sub" style="margin-top:-8px;">Ton prénom permet à ton professeur de suivre ta progression. Tu peux changer de profil à tout moment si vous partagez cet appareil.</p>
+      <div class="new-profile-row">
+        <input type="text" id="new-profile-input" placeholder="Ton prénom…" maxlength="24" ${state.onboardingChecking ? "disabled" : ""} />
+        <button class="btn btn-secondary" id="add-profile-btn" ${state.onboardingChecking ? "disabled" : ""}>${state.onboardingChecking ? "Vérification…" : "C'est parti"}</button>
+      </div>
+    `;
+  } else {
+    bodyHtml = `
+      <h3>👤 Profils</h3>
       ${state.profiles.list.map((p) => `
         <div class="profile-row ${p.id === state.profiles.activeId ? "active" : ""}" data-id="${escapeHtml(p.id)}">
           <span class="name">${escapeHtml(p.name)}</span>
@@ -722,12 +897,14 @@ function renderProfileModal() {
         </div>
       `).join("")}
       <div class="new-profile-row">
-        <input type="text" id="new-profile-input" placeholder="${isFirstLaunch ? "Ton prénom…" : "Nouveau prénom…"}" maxlength="24" />
-        <button class="btn btn-secondary" id="add-profile-btn">${isFirstLaunch ? "C'est parti" : "Ajouter"}</button>
+        <input type="text" id="new-profile-input" placeholder="Nouveau prénom…" maxlength="24" />
+        <button class="btn btn-secondary" id="add-profile-btn">Ajouter</button>
       </div>
-      ${!isFirstLaunch ? `<button class="btn btn-ghost" id="close-modal-btn" style="width:100%;margin-top:14px;">Fermer</button>` : ""}
-    </div>
-  `;
+      <button class="btn btn-ghost" id="close-modal-btn" style="width:100%;margin-top:14px;">Fermer</button>
+    `;
+  }
+
+  wrap.innerHTML = `<div class="modal">${bodyHtml}</div>`;
   document.body.appendChild(wrap);
 
   if (!isFirstLaunch) {
@@ -737,7 +914,7 @@ function renderProfileModal() {
     document.getElementById("close-modal-btn").onclick = closeModal;
   }
 
-  wrap.querySelectorAll(".profile-row").forEach((row) => {
+  wrap.querySelectorAll(".profile-row[data-id]").forEach((row) => {
     row.addEventListener("click", (e) => {
       if (e.target.dataset.del) return;
       switchProfile(row.dataset.id);
@@ -749,14 +926,44 @@ function renderProfileModal() {
       deleteProfile(el.dataset.del);
     });
   });
-  document.getElementById("add-profile-btn").onclick = addProfileFromInput;
-  document.getElementById("new-profile-input").addEventListener("keydown", (e) => {
-    if (e.key === "Enter") addProfileFromInput();
-  });
+
+  if (isFirstLaunch && suggestion) {
+    document.getElementById("suggestion-retry-btn").onclick = () => {
+      state.onboardingSuggestion = null;
+      render();
+    };
+    document.getElementById("suggestion-accept-btn").onclick = () => {
+      finalizeOnboarding(suggestion.suggested);
+    };
+    return;
+  }
+
+  const addBtn = document.getElementById("add-profile-btn");
+  if (addBtn) addBtn.onclick = addProfileFromInput;
+  const inputEl = document.getElementById("new-profile-input");
+  if (inputEl) {
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") addProfileFromInput();
+    });
+  }
 
   function closeModal() {
     state.showProfileModal = false;
-    wrap.remove();
+    removeModalBackdrop();
+  }
+  function finalizeOnboarding(name) {
+    const profile = getActiveProfile();
+    profile.name = name;
+    saveProfiles(state.profiles);
+    localStorage.setItem("pcflash_onboarded_v1", "1");
+    state.isOnboarding = false;
+    state.onboardingChecking = false;
+    state.onboardingSuggestion = null;
+    syncToCloud();
+    state.showProfileModal = false;
+    removeModalBackdrop();
+    state.screen = state.level ? "home" : "level";
+    render();
   }
   function addProfileFromInput() {
     const input = document.getElementById("new-profile-input");
@@ -764,17 +971,19 @@ function renderProfileModal() {
     if (!name) return;
 
     if (isFirstLaunch) {
-      // Premier lancement : on renomme le profil "Élève" créé par défaut
-      // au lieu d'en ajouter un nouveau.
-      const profile = getActiveProfile();
-      profile.name = name;
-      saveProfiles(state.profiles);
-      localStorage.setItem("pcflash_onboarded_v1", "1");
-      state.isOnboarding = false;
-      syncToCloud();
-      closeModal();
-      state.screen = "home";
+      // Premier lancement : on vérifie que le prénom n'est pas déjà pris par
+      // un autre élève (via le tableau de bord partagé) avant de valider.
+      state.onboardingChecking = true;
       render();
+      findAvailableName(name).then((available) => {
+        state.onboardingChecking = false;
+        if (available.toLowerCase() === name.toLowerCase()) {
+          finalizeOnboarding(available);
+        } else {
+          state.onboardingSuggestion = { typed: name, suggested: available };
+          render();
+        }
+      });
       return;
     }
 
@@ -789,15 +998,17 @@ function renderProfileModal() {
     state.profiles.activeId = id;
     saveProfiles(state.profiles);
     state.stats = loadStats(id);
+    state.level = localStorage.getItem(`pcflash_level_v1::${id}`) || null;
     state.selectedChapters.clear();
-    const savedRaw = localStorage.getItem(`pcflash_lastsel_v2::${id}`);
-    if (savedRaw) {
-      try { JSON.parse(savedRaw).forEach((cid) => state.selectedChapters.add(cid)); } catch (e) {}
+    if (state.level) {
+      const savedRaw = localStorage.getItem(`pcflash_lastsel_v2::${id}::${state.level}`);
+      if (savedRaw) {
+        try { JSON.parse(savedRaw).forEach((cid) => state.selectedChapters.add(cid)); } catch (e) {}
+      }
     }
-    if (state.selectedChapters.size === 0) CHAPTERS.forEach((c) => state.selectedChapters.add(c.id));
     syncToCloud();
     closeModal();
-    state.screen = "home";
+    state.screen = state.level ? "home" : "level";
     render();
   }
   function deleteProfile(id) {
@@ -807,15 +1018,44 @@ function renderProfileModal() {
     if (!confirm(`Supprimer le profil "${target.name}" et toutes ses statistiques ?`)) return;
     state.profiles.list = state.profiles.list.filter((p) => p.id !== id);
     localStorage.removeItem(statsKey(id));
-    localStorage.removeItem(`pcflash_lastsel_v2::${id}`);
+    localStorage.removeItem(`pcflash_level_v1::${id}`);
+    Object.keys(localStorage)
+      .filter((k) => k.startsWith(`pcflash_lastsel_v2::${id}::`))
+      .forEach((k) => localStorage.removeItem(k));
     if (state.profiles.activeId === id) {
       state.profiles.activeId = state.profiles.list[0].id;
       state.stats = loadStats(state.profiles.activeId);
+      state.level = localStorage.getItem(`pcflash_level_v1::${state.profiles.activeId}`) || null;
     }
     saveProfiles(state.profiles);
     closeModal();
+    state.screen = state.level ? state.screen : "level";
     render();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Vérifie si un prénom est déjà pris par un autre élève (via le tableau de
+// bord partagé) et propose une variante numérotée si besoin. Best-effort :
+// si le tableau de bord est injoignable (hors ligne...), on laisse passer le
+// prénom tel quel plutôt que de bloquer l'élève.
+// ---------------------------------------------------------------------------
+function findAvailableName(name) {
+  return new Promise((resolve) => {
+    if (!window.db) { resolve(name); return; }
+    window.db.collection("students").get().then((snapshot) => {
+      const taken = new Set();
+      snapshot.forEach((doc) => {
+        const n = doc.data() && doc.data().name;
+        if (n) taken.add(String(n).trim().toLowerCase());
+      });
+      const base = name.trim();
+      if (!taken.has(base.toLowerCase())) { resolve(base); return; }
+      let i = 2;
+      while (taken.has((base + i).toLowerCase())) i++;
+      resolve(base + i);
+    }).catch(() => resolve(name));
+  });
 }
 
 // ---------------------------------------------------------------------------
